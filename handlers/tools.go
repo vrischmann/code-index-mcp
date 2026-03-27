@@ -10,10 +10,12 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/sourcegraph/zoekt"
 	"github.com/trondhindenes/code-index-mcp/indexer"
 )
 
 var manager *indexer.IndexManager
+var remoteSearcher *indexer.RemoteSearcher
 var webServerManager *indexer.WebServerManager
 
 func init() {
@@ -21,6 +23,11 @@ func init() {
 	indexDir := getIndexDirectory()
 	manager = indexer.NewIndexManager(indexDir)
 	webServerManager = indexer.NewWebServerManager(indexDir)
+
+	// Set up remote searcher if ZOEKT_URL is configured
+	if url := os.Getenv("ZOEKT_URL"); url != "" {
+		remoteSearcher = indexer.NewRemoteSearcher(url)
+	}
 }
 
 // getIndexDirectory returns the directory where indexes should be stored
@@ -61,6 +68,46 @@ func getIndexDirectory() string {
 
 // RegisterTools registers all MCP tools with the server
 func RegisterTools(s *server.MCPServer) {
+	if remoteSearcher != nil {
+		// External mode only exposes tools that are meaningful when backed by ZOEKT_URL.
+		searchTool := mcp.NewTool("search_code",
+			mcp.WithDescription(`Search code using Zoekt query syntax against the external Zoekt instance configured by ZOEKT_URL.
+
+QUERY SYNTAX:
+- Content search: "search_term" or /regex.*pattern/
+- Fields: file:pattern, lang:go, repo:name, branch:main, sym:SymbolName
+- Negation: -lang:javascript (exclude), -file:*.test.go
+- Grouping: (lang:go or lang:rust) with parentheses
+- Operators: "or" explicit, "and" implicit (space-separated)
+
+KEY FIELDS:
+- file:f (filename pattern), lang:l (language), repo:r (repository)
+- case:yes|no|auto (default: auto - sensitive if uppercase present)
+- branch:b (specific branch), type:filematch|filename|repo (result type)
+
+EXAMPLES:
+- "func main" file:main.go
+- lang:go content:/func\s+\w+/
+- (repo:org/repo1 or repo:org/repo2) "import"
+- case:yes "MyStruct" -file:*_test.go`),
+			mcp.WithString("query",
+				mcp.Required(),
+				mcp.Description(`Zoekt query. Use "text" for literal search or /regex/ for patterns. Combine with fields: file:name, lang:go, case:yes. Use - prefix for exclusion, () for grouping, "or" for alternatives. Examples: "TODO" file:*.go, (lang:go or lang:rust) "error", -file:*_test.go "import"`),
+			),
+			mcp.WithNumber("max_files",
+				mcp.Description("Maximum number of files to return (default: 20)"),
+			),
+			mcp.WithNumber("max_lines_per_file",
+				mcp.Description("Maximum matches to show per file (default: 3)"),
+			),
+			mcp.WithBoolean("files_only",
+				mcp.Description("Only return file paths, no line content (default: false)"),
+			),
+		)
+		s.AddTool(searchTool, handleSearchCode)
+		return
+	}
+
 	// Index directory tool
 	indexTool := mcp.NewTool("index_directory",
 		mcp.WithDescription("Index a source code directory for fast searching. Creates a Zoekt index that enables fast code search."),
@@ -73,10 +120,30 @@ func RegisterTools(s *server.MCPServer) {
 
 	// Search tool
 	searchTool := mcp.NewTool("search_code",
-		mcp.WithDescription("Search for code across indexed directories using Zoekt query syntax. Returns compact grep-like output."),
+		mcp.WithDescription(`Search for code across indexed directories using Zoekt query syntax.
+
+QUERY SYNTAX:
+- Content search: "search_term" or /regex.*pattern/
+- Fields: file:pattern, lang:go, repo:name, branch:main, sym:SymbolName
+- Negation: -lang:javascript (exclude), -file:*.test.go
+- Grouping: (lang:go or lang:rust) with parentheses
+- Operators: "or" explicit, "and" implicit (space-separated)
+
+KEY FIELDS:
+- file:f (filename pattern), lang:l (language), repo:r (repository)
+- case:yes|no|auto (default: auto - sensitive if uppercase present)
+- branch:b (specific branch), type:filematch|filename|repo (result type)
+
+EXAMPLES:
+- "func main" file:main.go
+- lang:go content:/func\s+\w+/
+- (repo:org/repo1 or repo:org/repo2) "import"
+- case:yes "MyStruct" -file:*_test.go
+
+Returns compact grep-like output.`),
 		mcp.WithString("query",
 			mcp.Required(),
-			mcp.Description("The search query. Supports: regex patterns, 'file:pattern' for file filtering, 'lang:go' for language, '-pattern' for exclusion, 'case:yes' for case-sensitive"),
+			mcp.Description(`Zoekt query. Use "text" for literal search or /regex/ for patterns. Combine with fields: file:name, lang:go, case:yes. Use - prefix for exclusion, () for grouping, "or" for alternatives. Examples: "TODO" file:*.go, (lang:go or lang:rust) "error", -file:*_test.go "import"`),
 		),
 		mcp.WithString("directory",
 			mcp.Description("Optional: limit search to a specific indexed directory path"),
@@ -166,9 +233,22 @@ func handleSearchCode(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		FilesOnly:       request.GetBool("files_only", false),
 	}
 
-	result, err := manager.Search(query, directory, opts)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+	var result *indexer.SearchResult
+
+	if remoteSearcher != nil {
+		zoektOpts := &zoekt.SearchOptions{
+			MaxDocDisplayCount: opts.MaxFiles * 2,
+		}
+		zoektResult, err := remoteSearcher.Search(ctx, query, zoektOpts)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+		}
+		result = indexer.FormatRemoteSearchResults(zoektResult, opts)
+	} else {
+		result, err = manager.Search(query, directory, opts)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Search failed: %v", err)), nil
+		}
 	}
 
 	if len(result.Lines) == 0 {
@@ -217,6 +297,10 @@ func handleIndexInfo(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 		"index_directory": manager.GetIndexDir(),
 		"description":     "All indexes are stored as .zoekt files in the index directory, with unique prefixes per source directory",
 	}
+	if remoteSearcher != nil {
+		info["mode"] = "external"
+		info["zoekt_url"] = os.Getenv("ZOEKT_URL")
+	}
 
 	output, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
@@ -238,6 +322,9 @@ func getDefaultWebserverPort() int {
 }
 
 func handleStartWebserver(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if remoteSearcher != nil {
+		return mcp.NewToolResultError("Not available in external mode (ZOEKT_URL is set). The webserver is managed externally."), nil
+	}
 	// Get port from request or use default
 	port := int(request.GetFloat("port", float64(getDefaultWebserverPort())))
 
@@ -255,6 +342,9 @@ func handleStartWebserver(ctx context.Context, request mcp.CallToolRequest) (*mc
 }
 
 func handleStopWebserver(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if remoteSearcher != nil {
+		return mcp.NewToolResultError("Not available in external mode (ZOEKT_URL is set). The webserver is managed externally."), nil
+	}
 	if err := webServerManager.Stop(); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to stop web server: %v", err)), nil
 	}
@@ -263,6 +353,9 @@ func handleStopWebserver(ctx context.Context, request mcp.CallToolRequest) (*mcp
 }
 
 func handleWebserverStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if remoteSearcher != nil {
+		return mcp.NewToolResultError("Not available in external mode (ZOEKT_URL is set). The webserver is managed externally."), nil
+	}
 	status := webServerManager.Status()
 
 	output, err := json.MarshalIndent(status, "", "  ")
