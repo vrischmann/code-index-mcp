@@ -21,7 +21,7 @@ type IndexManager struct {
 	indexDir string
 }
 
-// NewIndexManager creates a new index manager with the given base directory
+// NewIndexManager creates a new index manager with the given base directory.
 func NewIndexManager(indexDir string) *IndexManager {
 	return &IndexManager{indexDir: indexDir}
 }
@@ -180,10 +180,9 @@ type SearchResult struct {
 	Lines        []string // Compact output lines: "file:line: content" or just "file"
 }
 
-// Search performs a search across all indexes or a specific index
-// Returns compact grep-like output to minimize context usage
+// Search performs a search across local indexes.
+// Returns compact grep-like output to minimize context usage.
 func (m *IndexManager) Search(queryStr string, sourceDir string, opts SearchOptions) (*SearchResult, error) {
-	// Apply defaults for zero values
 	if opts.MaxFiles <= 0 {
 		opts.MaxFiles = 20
 	}
@@ -194,146 +193,58 @@ func (m *IndexManager) Search(queryStr string, sourceDir string, opts SearchOpti
 		opts.MaxLineLength = 200
 	}
 
-	// Always search in the base index directory (flat structure)
-	searchDir := m.indexDir
+	zoektOpts := &zoekt.SearchOptions{
+		MaxDocDisplayCount: opts.MaxFiles * 2,
+	}
 
-	// If a specific directory is requested, add a repo filter to the query
 	if sourceDir != "" {
 		absPath, err := filepath.Abs(sourceDir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve path: %w", err)
 		}
 		prefix := m.getIndexPrefix(absPath)
-		// Add repo filter to query
 		queryStr = fmt.Sprintf("repo:%s %s", prefix, queryStr)
 	}
 
-	// Load the searcher
-	searcher, err := search.NewDirectorySearcher(searchDir)
+	searcher, err := search.NewDirectorySearcher(m.indexDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load index: %w", err)
 	}
 	defer searcher.Close()
 
-	// Parse the query
 	q, err := query.Parse(queryStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse query: %w", err)
 	}
 
-	// Set search options - request more than we need to get accurate totals
-	zoektOpts := &zoekt.SearchOptions{
-		MaxDocDisplayCount: opts.MaxFiles * 2, // Get extra for total count
-	}
-
-	// Perform the search
 	result, err := searcher.Search(context.Background(), q, zoektOpts)
 	if err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	// Load metadata to map repo names to source directories
 	metadata := m.loadAllMetadata()
-
-	// Build compact output
-	sr := &SearchResult{
-		TotalFiles:   len(result.Files),
-		TotalMatches: 0,
-	}
-
-	filesProcessed := 0
-	for _, fileMatch := range result.Files {
-		if filesProcessed >= opts.MaxFiles {
-			break
-		}
-		filesProcessed++
-
-		// Get source directory for full path
+	resolvePath := func(repo, fileName string) string {
 		baseDir := ""
-		if meta, ok := metadata[fileMatch.Repository]; ok {
+		if meta, ok := metadata[repo]; ok {
 			baseDir = meta.SourceDir
 		}
-
-		fullPath := fileMatch.FileName
+		fullPath := fileName
 		if baseDir != "" {
-			fullPath = filepath.Join(baseDir, fileMatch.FileName)
+			fullPath = filepath.Join(baseDir, fileName)
 		}
-
-		if opts.FilesOnly {
-			sr.Lines = append(sr.Lines, fullPath)
-			continue
-		}
-
-		// Collect matches from LineMatches
-		linesAdded := 0
-		for _, lineMatch := range fileMatch.LineMatches {
-			sr.TotalMatches++
-			if linesAdded >= opts.MaxLinesPerFile {
-				continue
-			}
-			linesAdded++
-
-			content := strings.TrimRight(string(lineMatch.Line), "\n\r")
-			content = truncateLine(content, opts.MaxLineLength)
-
-			sr.Lines = append(sr.Lines, fmt.Sprintf("%s:%d: %s",
-				fullPath, lineMatch.LineNumber, content))
-		}
-
-		// Handle ChunkMatches if LineMatches is empty
-		if len(fileMatch.LineMatches) == 0 {
-			for _, chunk := range fileMatch.ChunkMatches {
-				lines := strings.Split(string(chunk.Content), "\n")
-				for i, line := range lines {
-					if strings.TrimSpace(line) == "" {
-						continue
-					}
-					sr.TotalMatches++
-					if linesAdded >= opts.MaxLinesPerFile {
-						continue
-					}
-					linesAdded++
-
-					content := truncateLine(strings.TrimRight(line, "\r"), opts.MaxLineLength)
-					lineNum := int(chunk.ContentStart.LineNumber) + i
-
-					sr.Lines = append(sr.Lines, fmt.Sprintf("%s:%d: %s",
-						fullPath, lineNum, content))
-				}
-			}
-		}
-
-		// Add indicator if there are more matches in this file
-		totalInFile := len(fileMatch.LineMatches)
-		if totalInFile == 0 {
-			for _, chunk := range fileMatch.ChunkMatches {
-				totalInFile += strings.Count(string(chunk.Content), "\n") + 1
-			}
-		}
-		if totalInFile > opts.MaxLinesPerFile {
-			sr.Lines = append(sr.Lines, fmt.Sprintf("  ... and %d more matches in this file",
-				totalInFile-opts.MaxLinesPerFile))
-		}
+		return fullPath
 	}
 
-	// Add summary if results were truncated
-	if sr.TotalFiles > opts.MaxFiles {
-		sr.Lines = append(sr.Lines, fmt.Sprintf("\n[Showing %d of %d files. Use max_files to see more]",
-			opts.MaxFiles, sr.TotalFiles))
-	}
-
-	return sr, nil
+	return formatSearchResults(result, opts, resolvePath), nil
 }
 
-// truncateLine shortens a line to maxLen, adding ellipsis if truncated
-func truncateLine(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+// FormatRemoteSearchResults converts a remote zoekt search result into our compact format.
+// It is used by the handler layer for external search.
+func FormatRemoteSearchResults(result *zoekt.SearchResult, opts SearchOptions) *SearchResult {
+	resolvePath := func(repo, fileName string) string {
+		return filepath.Join(repo, fileName)
 	}
-	if maxLen <= 3 {
-		return s[:maxLen]
-	}
-	return s[:maxLen-3] + "..."
+	return formatSearchResults(result, opts, resolvePath)
 }
 
 // IndexInfo contains information about an index
