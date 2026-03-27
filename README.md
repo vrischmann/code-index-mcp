@@ -84,6 +84,10 @@ Default index locations:
 
 ## Available Tools
 
+Tool exposure depends on mode:
+- Local mode (default): all tools below are available.
+- External mode (`ZOEKT_URL` set): only `search_code` is exposed.
+
 ### `index_directory`
 
 Index a source code directory for fast searching.
@@ -98,11 +102,11 @@ Index the directory /Users/me/projects/myapp
 
 ### `search_code`
 
-Search for code across indexed directories. Returns compact grep-like output to minimize context window usage.
+Search for code using Zoekt query syntax. Returns compact grep-like output to minimize context window usage.
 
 **Parameters:**
 - `query` (required): The search query using Zoekt syntax
-- `directory` (optional): Limit search to a specific indexed directory
+- `directory` (optional, local mode only): Limit search to a specific indexed directory
 - `max_files` (optional): Maximum files to return (default: 20)
 - `max_lines_per_file` (optional): Maximum matches per file (default: 3)
 - `files_only` (optional): Only return file paths, no line content (default: false)
