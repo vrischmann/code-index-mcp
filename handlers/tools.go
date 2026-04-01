@@ -14,9 +14,11 @@ import (
 	"github.com/trondhindenes/code-index-mcp/indexer"
 )
 
-var manager *indexer.IndexManager
-var remoteSearcher *indexer.RemoteSearcher
-var webServerManager *indexer.WebServerManager
+var (
+	manager          *indexer.IndexManager
+	remoteSearcher   *indexer.RemoteSearcher
+	webServerManager *indexer.WebServerManager
+)
 
 func init() {
 	// Initialize the index manager with user profile directory
@@ -71,6 +73,8 @@ func RegisterTools(s *server.MCPServer) {
 	if remoteSearcher != nil {
 		// External mode only exposes tools that are meaningful when backed by ZOEKT_URL.
 		searchTool := mcp.NewTool("search_code",
+			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithDestructiveHintAnnotation(false),
 			mcp.WithDescription(`Search code using Zoekt query syntax against the external Zoekt instance configured by ZOEKT_URL.
 
 QUERY SYNTAX:
