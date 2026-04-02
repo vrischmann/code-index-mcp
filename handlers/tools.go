@@ -13,8 +13,10 @@ import (
 	"github.com/trondhindenes/code-index-mcp/indexer"
 )
 
-var manager *indexer.IndexManager
-var webServerManager *indexer.WebServerManager
+var (
+	manager          *indexer.IndexManager
+	webServerManager *indexer.WebServerManager
+)
 
 func init() {
 	// Initialize the index manager with user profile directory
@@ -73,6 +75,8 @@ func RegisterTools(s *server.MCPServer) {
 
 	// Search tool
 	searchTool := mcp.NewTool("search_code",
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithDescription("Search for code across indexed directories using Zoekt query syntax. Returns compact grep-like output."),
 		mcp.WithString("query",
 			mcp.Required(),
